@@ -6,9 +6,11 @@ Starting from `terraform-provider-vault` v5.2.0, the provider setting `set_names
 
 The regression was introduced by PR [#2540](https://github.com/hashicorp/terraform-provider-vault/pull/2540) and affects all versions from v5.2.0 onwards (confirmed on v5.2.1 and v5.4.0).
 
-An open fix exists: PR [#2799](https://github.com/hashicorp/terraform-provider-vault/pull/2799) — "fix: respect set_namespace_from_token=false in setClient" — but has not been merged as of 2026-05-29.
+An open fix exists: PR [#2799](https://github.com/hashicorp/terraform-provider-vault/pull/2799) — "fix: respect set_namespace_from_token=false in setClient" — however, **PR #2799 is incomplete** and does not fully resolve the issue (see "Why PR #2799 Is Insufficient" below).
 
 **The bug is auth-method-agnostic.** It occurs in the `setClient()` function which runs after any authentication (token, approle, AWS IAM, JWT, etc.). The reproduction below uses a simple token for clarity.
+
+**No state migration is required.** We have verified that the correct fix works seamlessly with existing Terraform state created by v5.1.0. The state format is unchanged; the bug is purely a runtime namespace prepending issue.
 
 ---
 
@@ -179,17 +181,87 @@ terraform destroy -var="vault_address=..." -var="vault_token=..."
 
 1. Provider receives a token scoped to `admin` namespace
 2. `set_namespace_from_token = false` is configured BUT...
-3. PR #2540 added code in `setClient()` that **unconditionally** sets the provider namespace:
+3. PR #2540 added code in `setClient()` that **unconditionally** sets the provider namespace in two places:
    ```go
-   // internal/provider/meta.go, lines 373-375 (added by PR #2540):
-   if err := d.Set(consts.FieldNamespace, namespace); err != nil {
-       return err
+   // internal/provider/meta.go — the second "if namespace" block added by PR #2540:
+   if namespace != "" {
+       // This writes to ResourceData unconditionally:
+       if err := d.Set(consts.FieldNamespace, namespace); err != nil {
+           return fmt.Errorf("failed to set namespace on provider: %w", err)
+       }
+       // This sets the namespace on the root client unconditionally:
+       client.SetNamespace(namespace)
    }
    ```
-   This runs regardless of `set_namespace_from_token` setting.
-4. Provider's internal namespace is now `admin` (from the token)
-5. Resource specifies `namespace = "admin"` → gets appended → `admin/admin`
-6. API call uses `X-Vault-Namespace: admin/admin` → 404 ✗
+   Both of these run regardless of the `set_namespace_from_token` setting.
+4. Provider's internal namespace is now `admin` (from the token) — stored in both ResourceData AND the client's namespace header
+5. When a resource specifies `namespace = "admin"`, `GetNSClient("admin")` is called
+6. `GetNSClient` checks `p.resourceData.GetOk("namespace")` → finds `"admin"` → prepends it: `"admin/admin"`
+7. API call uses `X-Vault-Namespace: admin/admin` → 404 ✗
+
+---
+
+## Why PR #2799 Is Insufficient
+
+PR [#2799](https://github.com/hashicorp/terraform-provider-vault/pull/2799) by @bpaquet guards only the `d.Set(consts.FieldNamespace, namespace)` call in the second block. It tracks whether the namespace came from the token and skips the `d.Set` if so.
+
+However, this fix is **incomplete** because:
+
+1. **`client.SetNamespace(namespace)` is still called unconditionally.** The root client gets the `admin` namespace set on it. When `GetNSClient` clones this client, the clone inherits the namespace header. Even though ResourceData is clean, the cloned client already carries `admin` as its base namespace.
+
+2. **`GetResourceDataBool` returns incorrect defaults during certain operations.** The function uses `d.GetRawConfig()` which returns null during state refresh and destroy operations. When null, it falls back to the default value (`true`), effectively ignoring the user's `set_namespace_from_token = false` configuration during those phases.
+
+### The correct fix
+
+The fix must **reset the `namespace` variable to `""`** when `set_namespace_from_token = false` and the namespace was derived from the token. This prevents the entire second block from executing — no `d.Set`, no `client.SetNamespace`:
+
+```go
+if namespace == "" && tokenNamespace != "" {
+    log.Printf("[WARN] The provider namespace should be set whenever ...")
+    namespace = tokenNamespace
+
+    setTokenFromNamespace := GetResourceDataBool(d, consts.FieldSetNamespaceFromToken, "VAULT_SET_NAMESPACE_FROM_TOKEN", true)
+    // Fallback: also check d.GetOk() directly, as GetResourceDataBool may
+    // return the default (true) when RawConfig is null during refresh/destroy.
+    if val, ok := d.GetOk(consts.FieldSetNamespaceFromToken); ok {
+        setTokenFromNamespace = val.(bool)
+    }
+
+    if setTokenFromNamespace {
+        if err := d.Set(consts.FieldNamespace, namespace); err != nil {
+            return err
+        }
+    } else {
+        // When set_namespace_from_token=false, do NOT propagate the token's
+        // namespace to ResourceData or the client. Reset namespace so the
+        // subsequent block is skipped entirely.
+        namespace = ""
+    }
+}
+
+if namespace != "" {
+    // This block now only executes when the namespace was explicitly
+    // configured on the provider (not derived from the token).
+    if err := d.Set(consts.FieldNamespace, namespace); err != nil {
+        return fmt.Errorf("failed to set namespace on provider: %w", err)
+    }
+    client.SetNamespace(namespace)
+}
+```
+
+This approach:
+- Preserves the fix from PR #2540 (VAULT_NAMESPACE env var is still honored when explicitly set)
+- Correctly respects `set_namespace_from_token = false`
+- Does not require any state migration — existing state from v5.1.0 works as-is
+- Works for all auth methods (token, approle, AWS IAM, JWT, etc.)
+
+We have **verified this fix locally** by building a patched provider from `main` and testing against an HCP Vault cluster with both fresh state and existing state from v5.1.0.
+
+---
+
+## State Migration: Not Required
+
+We confirmed that the correct fix works with existing Terraform state created by v5.1.0 without any state migration. The state stores absolute namespace paths (e.g., `"admin"`, `"admin/bug-repro"`). With the fix applied, the provider has no internal namespace prefix, so these paths are used as-is by `GetNSClient` — exactly as they were in v5.1.0.
 
 ---
 
@@ -201,7 +273,7 @@ Symptoms include:
 - `no handler for route "admin/identity/lookup/group"` (404)
 - `no Identity Entity found` / `no Identity Group found`
 - Provider plugin crashes (nil pointer dereference when receiving unexpected 404 responses)
-- Complete inability to run `terraform plan` on any workspace
+- Complete inability to run `terraform plan` or `terraform apply` on any workspace
 
 ---
 
@@ -218,23 +290,6 @@ Symptoms include:
 
 ---
 
-## The Fix (PR #2799 — Open)
-
-PR [#2799](https://github.com/hashicorp/terraform-provider-vault/pull/2799) by @bpaquet (opened Feb 27, 2026) adds a check for `set_namespace_from_token` before setting the namespace in `setClient()`:
-
-```go
-// Only set namespace from token if set_namespace_from_token is true (or not explicitly set to false)
-if setNamespaceFromToken {
-    if err := d.Set(consts.FieldNamespace, namespace); err != nil {
-        return err
-    }
-}
-```
-
-This restores the pre-5.2.0 behavior when `set_namespace_from_token = false` is configured.
-
----
-
 ## Timeline
 
 | Date | Event |
@@ -246,14 +301,17 @@ This restores the pre-5.2.0 behavior when `set_namespace_from_token = false` is 
 | 2025-08-18 | PR #2540 merged — introduces the regression |
 | 2025-08-18 | v5.2.0 released — `set_namespace_from_token = false` broken |
 | 2025-08-19 | v5.2.1 released — same issue + additional panic fix attempts |
-| 2026-02-27 | PR [#2799](https://github.com/hashicorp/terraform-provider-vault/pull/2799) opened — fix for this exact issue |
-| 2026-05-29 | PR #2799 still not merged (3 months) |
+| 2026-02-27 | PR [#2799](https://github.com/hashicorp/terraform-provider-vault/pull/2799) opened — partial fix (insufficient) |
+| 2026-06-01 | We verified a complete fix locally (see "The correct fix" above) |
 
 ---
 
 ## Request
 
-Please prioritize the merge of PR [#2799](https://github.com/hashicorp/terraform-provider-vault/pull/2799) which correctly fixes this regression by respecting `set_namespace_from_token = false` in the `setClient()` function.
+1. **Do not merge PR #2799 as-is** — it is incomplete and will not fully resolve the issue for users who also have `client.SetNamespace` causing prepending via cloned clients.
+2. **Apply the complete fix** as described in "The correct fix" section above — resetting `namespace = ""` when `set_namespace_from_token = false` prevents both the ResourceData and client namespace leakage.
+3. **No state migration is needed** — the fix is runtime-only and works with existing state from any previous provider version.
+4. **Prioritize this fix** — it has blocked upgrades past v5.1.0 for multiple customers for 10+ months.
 
 ---
 
@@ -262,6 +320,5 @@ Please prioritize the merge of PR [#2799](https://github.com/hashicorp/terraform
 - Issue [#1903](https://github.com/hashicorp/terraform-provider-vault/issues/1903) — Original namespace duplication report
 - Issue [#2331](https://github.com/hashicorp/terraform-provider-vault/issues/2331) — Related upgrade blocker
 - PR [#2540](https://github.com/hashicorp/terraform-provider-vault/pull/2540) — The change that introduced this regression
-- PR [#2799](https://github.com/hashicorp/terraform-provider-vault/pull/2799) — The pending fix
+- PR [#2799](https://github.com/hashicorp/terraform-provider-vault/pull/2799) — The pending partial fix (insufficient)
 - [Vault provider docs: set_namespace_from_token](https://registry.terraform.io/providers/hashicorp/vault/latest/docs#set_namespace_from_token)
-
